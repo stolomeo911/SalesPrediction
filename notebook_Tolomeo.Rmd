@@ -1,0 +1,186 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+# Overview of the dataset
+
+The dataset is provides information about:
+- the quantity sold
+- the item sold
+- the category to which belong the item
+- the store where is sold the item
+- date on which is sold
+
+The objective of the code challenge is to forecast the quantity sold for each item. Given that there is no specific request to forecast the quantity sold for a specific store, I would first exclude this variable as interesting for our analysis.
+The category could be of interest because we may expect that item belonging to the same category have similar economics (such us price, amount of sales), and so we could maybe use the same model for item belonging to the same category. However, we have not enough information about the logic behing the category and we have to predict the storage for only 10 items.Given this evidence, I have decided to exclude also this variable as of interest for our analysis ( I have only included this information for plotting the quantity time series). This information could be very useful in case we have to predict a very large number of items and creating an ad-hoc model for each item wouldn't be feasible.
+
+The only relevant variable is therefore, the historical quantity for each item at each date. As a consequence, I have decided to use ARIMA model to forecast the quantity.
+
+Some additional information which could be useful, is maybe the "number of clients" for each store, which could be useful to predict the sales in case of opening new stores selling the same item. In this case it could be maybe possible create a relation between item sold and dimension of the store, having a more complete model that can predict item sold in case of opening new store.
+
+ 
+
+
+# Selecting 10 item to predict
+
+I have identified for each item:
+ - number of data points
+ - price
+making an average of those i have identified the 10 most important items.
+This indicator allows first to identify the most complete time series (number of data points).
+In addition, give priority to item which are more expensive, which can potentially lead to 
+higher cost for non-optimal storage (i.e. by missing revenue for understorage or higher stock
+cost for overstorage)
+
+```{r}
+library(zoo)
+library(dplyr)
+library(bsts)
+```
+
+First, I have included the data from csv to dataframes. 
+
+```{r}
+setAs("character","myDate", function(from) as.Date(from, format="%d/%m/%Y") )
+df_sales = read.csv("C:/Users/tolom/OneDrive/Desktop/Code Challenge/Evo/test/sales_data.csv", header=TRUE,fileEncoding="UTF-8-BOM",
+                    colClasses = c("myDate", "integer", "integer", "integer", "integer", "integer"))
+df_store = read.csv("C:/Users/tolom/OneDrive/Desktop/Code Challenge/Evo/test/store_master.csv", header=TRUE, sep=";", fileEncoding="UTF-8-BOM")
+df_sales
+df_store
+```
+
+Then, I have manipulated the dataframe "df_sales" to create the metric i need to decide which
+item storage predict. The metric is stored in the column "metric_choice" and is:
+
+                      (Number of data points available for item + Price of item)/ 2
+
+```{r}
+new_df_sales <- df_sales %>%
+   group_by(date, item) %>%
+   summarise(qty = sum(qty), price = mean(unit_price))
+new_df_sales
+final_df_sales <- new_df_sales %>%
+   group_by(item) %>%
+   summarise(qty = sum(qty), DataPoints = n(), price = mean(price),
+             metric_choice = (DataPoints + price)/2)
+final_df_sales1 <- final_df_sales[rev(order(final_df_sales$metric_choice)), ]
+final_df_sales1
+```
+
+Below we can find the list of item choosen.
+
+```{r}
+list_of_item_to_predict = as.vector(t(final_df_sales1[1:10, "item"]))
+list_of_item_to_predict
+```
+
+I have created a subset of the original df_sales including only the data for the selected items.
+
+```{r}
+df_sales_for_model = df_sales[df_sales$item %in% list_of_item_to_predict, ]
+df_sales_for_model
+```
+
+I have grouped the quantity across all the stores for each date, in order to get a time series of the historical total storage per item.
+
+```{r}
+df_groupby_item_date_daily <- df_sales_for_model %>%
+   group_by(item, date) %>%
+   summarise(qty = sum(qty))
+
+for (item in list_of_item_to_predict)
+  {
+    t = as.Date(as.vector(t(df_groupby_item_date_daily[df_groupby_item_date_daily$item == item, "date"])))
+    q = as.vector(t(df_groupby_item_date_daily[df_groupby_item_date_daily$item == item, "qty"]))
+    title = paste("Daily Quantity ", item, "of category ", df_sales_for_model[df_sales_for_model$item == item, "item_category"][1]) 
+    plot(t, q, type="o",  main=title, xaxt="n", xlab="Date", ylab="Quantity")
+    axis.Date(1, at=df_groupby_item_date_daily$date, format="%b-%y", tcl=0)
+}
+
+```
+
+
+# The Model
+As a model prediction I have used an ARIMA model. This choice is the best given the dataset, since we have only the historical sold quantity for each item. 
+
+I couldn't consider the case when a new store is open (because of missing information), so my assumption is that the store selling the item are constant throught the forecasting period in terms of size and number.
+
+
+The model uses daily time series and is constructed with the following steps:
+- time series relevant for the item are selected
+- the time series is cleaned by removing the points where we have 3 or more consecutive missing values and by linearly interpolating the other missing values (where we have less than 3 consecutive missing values)
+- holiday effect are taken in account calibrating the fourier terms for the ARIMA model. The fourier term is calibrated such that the AICc is minimized
+- the model is calibrated on the whole time series removing the last 30 days. This is the trianing set of the model
+- The test set is the last 30 days of the time series
+- The model is evaluated using the MAPE (Mean Average Percentage Error). This measure is easy to understand because it provides the error in terms of percentages. Also, because absolute percentage errors are used, the problem of positive and negative errors canceling each other out is avoided. 
+
+The code creates the following output for each item:
+- a dataframe with the forecasted data (columns Date/Value)
+- a line plot highlighting the forecast time series
+- a summary of the ARIMA model calibrated
+- the optimal fourier term for holiday effects
+
+```{r}
+library(forecast)
+library(RQuantLib)
+library(MLmetrics)
+
+calibrate_k_fourier_term <- function(data, n) {
+bestfit <- list(aicc=Inf)
+for(i in 1:n)
+{
+  fit <- auto.arima(data, xreg=fourier(data, K=i), seasonal=FALSE)
+	if(fit$aicc < bestfit$aicc)
+    {
+        bestfit <- fit
+        bestk <- i
+    }
+    else
+    {
+    }
+}
+ return(bestk)
+}
+
+
+frequency = 365.25
+
+for (item in list_of_item_to_predict)
+  {
+    data_single_item = df_groupby_item_date_daily[df_groupby_item_date_daily$item == item, ]
+    time_vector <- seq(min(data_single_item$date), max(data_single_item$date), "1 day")
+    new_df <- data.frame(date = time_vector) %>% full_join(data_single_item, by = "date")
+    is.na.rle <- rle(is.na(new_df[, "qty"]))
+    is.na.rle$values <- is.na.rle$values & is.na.rle$lengths >= 3
+    new_df <- new_df[!inverse.rle(is.na.rle), ]
+    new_df[,2] = na.approx(new_df[,2], method="linear")
+    new_df[,3] = na.approx(new_df[,3], method="linear")
+    ts_data <- xts(new_df[1:(nrow(new_df)-30), "qty"], as.Date(new_df[1:(nrow(new_df)-30), "date"], format='%m/%d/%Y'))
+    k <- calibrate_k_fourier_term(ts(ts_data, frequency=frequency), 5)
+    print(paste("Optimal fourier term for item", item, " is: ", k))
+    holiday <- isHoliday(calendar="Italy", dates=as.Date(new_df[1:(nrow(new_df)-30), "date"], format='%m/%d/%Y'))
+    z <- fourier(ts(ts_data, frequency=frequency), K=k)
+
+    fit<- auto.arima(ts(ts_data, frequency=frequency), xreg=cbind(z,holiday), seasonal=FALSE, stepwise=FALSE, approximation=FALSE)
+    print(paste("Summary data for ", item))
+    summary(fit)
+    print(paste("Forecast data for ", item))
+
+    time_vector_forecast <-  seq(max(time_vector), max(time_vector) + 29, "1 day")
+    holidayf <- isHoliday(calendar="Italy", dates=time_vector_forecast)
+    zf <- fourier(ts(ts_data, frequency=frequency), K=k, h=30)
+    fcast <- forecast(fit, h=30,  xreg=cbind(zf,holidayf))
+    x = data.frame(time_vector_forecast, fcast$mean)
+    print(x)
+    print(" ")
+    fcast_to_print <- xts(fcast$mean, time_vector_forecast)
+    print(paste("MAPE for item ", item, ": ", MAPE(fcast$mean, new_df[(nrow(new_df)-29):nrow(new_df), "qty"])))
+    plot(fcast)
+
+  }
+
+
+```
+
